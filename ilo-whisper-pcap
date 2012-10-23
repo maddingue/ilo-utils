@@ -1,0 +1,269 @@
+#!/usr/bin/perl
+use strict;
+use feature qw< state >;
+use Getopt::Long;
+use IO::Interface::Simple;
+use Net::DHCP::Constants;
+use Net::DHCP::Packet;
+use NetPacket::Ethernet;
+use NetPacket::IP qw< :protos >;
+use NetPacket::UDP;
+use Net::Pcap qw< :functions :datalink >;
+
+
+$::PROGRAM = "ilo-whisper-pcap";
+$::VERSION = "1.00";
+
+
+use constant SUCCESS => 0;
+
+my %proto = (
+    IP_PROTO_IP    ,=> "IP",
+    IP_PROTO_ICMP  ,=> "ICMP",
+    IP_PROTO_IGMP  ,=> "IGMP",
+    IP_PROTO_IPIP  ,=> "IPIP",
+    IP_PROTO_TCP   ,=> "TCP",
+    IP_PROTO_UDP   ,=> "UDP",
+);
+
+
+#
+# main
+#
+MAIN: {
+    run() unless caller();
+}
+
+
+#
+# run()
+# ---
+sub run {
+    # default options
+    my %options;
+
+    # parse options
+    Getopt::Long::Configure(qw< no_auto_abbrev no_ignore_case >);
+    GetOptions(\%options, qw{
+        help|usage|h!  man!  version|V!
+        interface|i=s
+    }) or pod2usage(0);
+
+    # handle --version, --help and --man
+    $options{man}       and pod2usage(2);
+    $options{help}      and pod2usage(1);
+    $options{version}   and print "$::PROGRAM v$::VERSION\n" and exit;
+
+    # do the actual work
+    process(\%options);
+}
+
+
+#
+# pod2usage()
+# ---------
+sub pod2usage {
+    my ($n) = @_;
+    require Pod::Usage;
+    Pod::Usage::pod2usage({ -exitval => 0, -verbose => $n, -noperldoc => 1 });
+}
+
+
+#
+# process()
+# -------
+sub process {
+    my ($opts) = @_;
+
+    my $err;
+
+    # find a suitable Ethernet device
+    my $dev = $opts->{interface} || find_device();
+    pcap_lookupnet($dev, \my $net, \my $mask, \$err) == SUCCESS
+        or die "can't determine the network address of device $dev: $err\n";
+
+    my $pcap = pcap_open_live($dev, 1024, 1, 0, \$err)
+        or die "can't open device $dev: $err\n";
+    my $linktype = pcap_datalink_val_to_description(pcap_datalink($pcap));
+    print "listening on $dev, $linktype\n";
+
+    # apply a filter to only listen UDP packets
+    if (pcap_compile($pcap, \my $filter, "udp", 1, $mask) == SUCCESS) {
+        pcap_setfilter($pcap, $filter);
+    }
+    else {
+        pcap_perror($pcap, "warning: filter error");
+    }
+
+    pcap_loop($pcap, -1, \&process_packet, "");
+}
+
+
+#
+# process_packet()
+# --------------
+sub process_packet {
+    my ($user_data, $header, $packet) = @_;
+
+    # decode the Ethernet layer
+    my $eth_layer = NetPacket::Ethernet->decode($packet)
+        or warn "can't decode Ethernet layer\n" and return;
+
+    # decode the IP layer
+    my $ip_layer  = NetPacket::IP->decode($eth_layer->{data})
+        or warn "can't decode IP layer\n" and return;
+
+    # skip non UDP packet
+    return unless $ip_layer->{proto} == IP_PROTO_UDP;
+
+    # decode the UDP layer
+    my $udp_layer = NetPacket::UDP->decode($ip_layer->{data})
+        or warn "can't decode UDP layer\n" and return;
+
+    # skip non DHCP packets
+    return unless $udp_layer->{dest_port} == 67;
+
+    #print "IPv$ip_layer->{ver} packet ",
+    #    "from <$ip_layer->{src_ip}:$udp_layer->{src_port}> ",
+    #    "to <$ip_layer->{dest_ip}:$udp_layer->{dest_port}> ",
+    #    "proto $ip_layer->{proto}($proto{$ip_layer->{proto}}) ",
+    #    "length $ip_layer->{len}\n";
+
+    # decode the DHCP message
+    my $dhcp_request = eval { Net::DHCP::Packet->new($udp_layer->{data}) }
+        or warn "can't decode DHCP message\n" and return;
+    #(my $out = $dhcp_request->toString) =~ s/^/  /gm;
+    #print "DHCP packet:\n$out\n";
+
+    next unless $dhcp_request->getOptionValue(
+        DHO_VENDOR_CLASS_IDENTIFIER) eq "CPQRIB3";
+
+    # prettify the name (serial number) and MAC address
+    (my $req_name = $dhcp_request->getOptionValue(DHO_HOST_NAME)) =~ s/^ILO//;
+    my $mac_addr = substr($dhcp_request->chaddr, 0, 2 * $dhcp_request->hlen);
+    $mac_addr =~ s/(\w\w)/$1:/g; $mac_addr =~ s/:$//;
+
+    # print information about each iLO subsystem once
+    state %seen;
+    print "identified unconfigured iLO subsystem: $req_name \@ $mac_addr\n"
+        if not $seen{$req_name}++;
+}
+
+
+#
+# find_device()
+# -----------
+sub find_device {
+    my @devs = pcap_findalldevs(\my %devs, \my $err);
+
+    # filter out non Ethernet interfaces
+    @devs = grep linktype($_) == DLT_EN10MB, @devs;
+
+    # filter out loopack interfaces
+    @devs = grep {
+            my $iface = IO::Interface::Simple->new($_);
+            not $iface->is_loopback
+        } @devs;
+
+    return wantarray ? @devs : $devs[0]
+}
+
+
+#
+# linktype()
+# --------
+sub linktype {
+    my ($dev) = @_;
+
+    my $pcap = pcap_open_live($dev, 1024, 0, 0, \my $err) or return;
+    my $linktype = pcap_datalink($pcap);
+    pcap_close($pcap);
+
+    return $linktype
+}
+
+
+#
+# dotquad()
+# -------
+sub dotquad {
+    my($na, $nb, $nc, $nd);
+    my($net) = @_ ;
+    $na = $net >> 24 & 255 ;
+    $nb = $net >> 16 & 255 ;
+    $nc = $net >>  8 & 255 ;
+    $nd = $net & 255 ;
+    return "$na.$nb.$nc.$nd"
+}
+
+
+1
+
+__END__
+
+=pod
+
+=head1 NAME
+
+ilo-whisper-pcap - report about unconfigured iLO sybsystems
+
+=head1 SYNOPSIS
+
+    ilo-whisper-pcap [--interface=name]
+    ilo-whisper-pcap { --help | --man | --version }
+
+
+=head1 OPTIONS
+
+=head2 Program options
+
+=over
+
+=item B<-i>, B<--interface> I<name>
+
+Specify the network interface to use. By default, the program will
+use the first Ethernet interface.
+
+=back
+
+=head2 Help options
+
+=over
+
+=item B<-h>, B<--help>
+
+Print a short usage description, then exit.
+
+=item B<--man>
+
+Print the manual page of the program, then exit.
+
+=item B<-V>, B<--version>
+
+Print the program name and version, then exit.
+
+=back
+
+
+=head1 DESCRIPTION
+
+This small program listens to the local network to find and report about
+unconfigured iLO subsytems. This version uses the libpcap, thus allowing
+it to run at the same time than a DHCP server on the same host.
+
+The program runs until you interrupt it with ctrl-C.
+
+
+=head1 AUTHOR
+
+Sebastien Aperghis-Tramoni (sebastien@aperghis.net)
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright 2012 Sebastien Aperghis-Tramoni
+
+This program is free software; you can redistribute it and/or modify it
+under the MIT/X11 License.
+
+=cut
+
