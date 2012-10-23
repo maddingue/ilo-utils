@@ -1,0 +1,168 @@
+#!/usr/bin/perl
+use strict;
+use feature "state";
+use Getopt::Long;
+use IO::Socket::INET;
+use Net::DHCP::Packet;
+use Net::DHCP::Constants;
+
+
+$::PROGRAM = "ilo-whisper-udp";
+$::VERSION = "1.00";
+
+
+#
+# main
+#
+MAIN: {
+    run() unless caller();
+}
+
+
+#
+# run()
+# ---
+sub run {
+    # default options
+    my %options;
+
+    # parse options
+    Getopt::Long::Configure(qw< no_auto_abbrev no_ignore_case >);
+    GetOptions(\%options, qw{
+        help|usage|h!  man!  version|V!
+        local_addr|local-addr|l=s
+    }) or pod2usage(0);
+
+    # handle --version, --help and --man
+    $options{man}       and pod2usage(2);
+    $options{help}      and pod2usage(1);
+    $options{version}   and print "$::PROGRAM v$::VERSION\n" and exit;
+
+    # do the actual work
+    process(\%options);
+}
+
+
+#
+# pod2usage()
+# ---------
+sub pod2usage {
+    my ($n) = @_;
+    require Pod::Usage;
+    Pod::Usage::pod2usage({ -exitval => 0, -verbose => $n, -noperldoc => 1 });
+}
+
+
+#
+# process()
+# -------
+sub process {
+    my ($opts) = @_;
+
+    # open listening socket
+    my $socket = IO::Socket::INET->new(
+        LocalPort   => 67,
+        LocalAddr   => $opts->{local_addr} || "0.0.0.0",
+        Proto       => "udp",
+        Broadcast   => 1,
+    ) or die "Socket creation error: $@\n";
+
+    while (1) {
+        # wait for incoming message
+        my $peer = $socket->recv(my $buffer, 4096)
+            or warn "error during recv: $!\n" and next;
+
+        my ($port, $iaddr) = unpack_sockaddr_in($peer);
+        my $addr = inet_ntoa($iaddr);
+
+        # decode the DHCP message
+        my $dhcp_req = Net::DHCP::Packet->new($buffer)
+            or warn "can't decode DHCP message\n" and next;
+        #(my $out = $dhcp_request->toString) =~ s/^/  /gm;
+        #print "DHCP packet:\n$out\n";
+
+        next unless $dhcp_req->getOptionValue(
+            DHO_VENDOR_CLASS_IDENTIFIER) eq "CPQRIB3";
+
+        # prettify the name (serial number) and MAC address
+        (my $req_name = $dhcp_req->getOptionValue(DHO_HOST_NAME)) =~ s/^ILO//;
+        my $mac_addr = substr($dhcp_req->chaddr, 0, 2 * $dhcp_req->hlen);
+        $mac_addr =~ s/(\w\w)/$1:/g; $mac_addr =~ s/:$//;
+
+        # print information about each iLO subsystem once
+        state %seen;
+        print "identified unconfigured iLO subsystem: $req_name \@ $mac_addr\n"
+            if not $seen{$req_name}++;
+    }
+}
+
+
+1
+
+__END__
+
+=pod
+
+=head1 NAME
+
+ilo-whisper-udp - report about unconfigured iLO sybsystems
+
+=head1 SYNOPSIS
+
+    ilo-whisper-udp [--local-addr=address]
+    ilo-whisper-udp { --help | --man | --version }
+
+
+=head1 OPTIONS
+
+=head2 Program options
+
+=over
+
+=item B<-l>, B<--local-addr> I<address>
+
+Specify the local IP address to bind onto. By default, 0.0.0.0
+
+=back
+
+=head2 Help options
+
+=over
+
+=item B<-h>, B<--help>
+
+Print a short usage description, then exit.
+
+=item B<--man>
+
+Print the manual page of the program, then exit.
+
+=item B<-V>, B<--version>
+
+Print the program name and version, then exit.
+
+=back
+
+
+=head1 DESCRIPTION
+
+This small program listens to the local network to find and report about
+unconfigured iLO subsytems. This version uses a UDP socket, and as such
+can't be run at the same time as a DHCP server on the same host.
+
+The program runs until you interrupt it with ctrl-C.
+
+
+=head1 AUTHOR
+
+Sebastien Aperghis-Tramoni (sebastien@aperghis.net)
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright 2012 Sebastien Aperghis-Tramoni
+
+This program is free software; you can redistribute it and/or modify it
+under the MIT/X11 License.
+
+=cut
+
