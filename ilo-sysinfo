@@ -1,0 +1,200 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Long;
+use Net::ILO;
+
+
+$::PROGRAM = "ilo-sysinfo";
+$::VERSION = "1.00";
+
+
+#
+# main
+#
+MAIN: {
+    run() unless caller();
+}
+
+
+#
+# run()
+# ---
+sub run {
+    # default options
+    my %options = (
+        username    => "Administrator",
+    );
+
+    # parse options
+    Getopt::Long::Configure(qw< no_auto_abbrev no_ignore_case >);
+    GetOptions(\%options, qw{
+        help|usage|h!  man!  version|V!
+        username|U=s  password|P=s  format|F=s
+    }) or pod2usage(0);
+
+    # handle --version, --help and --man
+    $options{man}       and pod2usage(2);
+    $options{help}      and pod2usage(1);
+    $options{version}   and print "$::PROGRAM v$::VERSION\n" and exit;
+
+    # if there's no argument, print the usage
+    pod2usage(1) unless @ARGV;
+
+    # do the actual work
+    $options{ilo_addr} = shift @ARGV;
+    process(\%options);
+}
+
+
+#
+# pod2usage()
+# ---------
+sub pod2usage {
+    my ($n) = @_;
+    require Pod::Usage;
+    Pod::Usage::pod2usage({ -exitval => 0, -verbose => $n, -noperldoc => 1 });
+}
+
+
+#
+# process()
+# -------
+sub process {
+    my ($opts) = @_;
+
+    # connect to the iLO subsystem
+    my $ilo = Net::ILO->new({
+        address     => $opts->{ilo_addr},
+        username    => $opts->{username},
+        password    => $opts->{password},
+    });
+
+    # fetch system information
+    my %info = (
+        model       => $ilo->model,
+        serial_id   => $ilo->serialID,
+        biosdate    => $ilo->biosdate,
+        cpus        => $ilo->cpus,
+        ramslots    => [ grep defined $_->{speed}, @{$ilo->ramslots} ],
+        nics        => [],
+        ilo         => {
+            mac     => $ilo->macilo,
+            ip      => $ilo->ip_address,
+            mask    => $ilo->subnet_mask,
+            gateway => $ilo->gateway,
+            type    => $ilo->fw_type,
+            version => $ilo->fw_version,
+            date    => $ilo->fw_date,
+        },
+    );
+
+    # fetch NICs information
+    my $n = 1;
+    while (1) {
+        my $name = sprintf "mac%02d", $n++;
+        my $mac  = eval { $ilo->$name };
+        last unless defined $mac;
+        push @{$info{nics}}, { mac => $mac };
+    }
+
+    # print the result
+    if ($opts->{format} eq "json") {
+        require JSON;
+        print JSON::encode_json(\%info), $/;
+    }
+    elsif ($opts->{format} eq "perl") {
+        Dump(\%info);
+    }
+    else {
+        require YAML;
+        print YAML::Dump(\%info);
+    }
+}
+
+
+#
+# Dump()
+# ----
+sub Dump {
+    require Data::Dumper;
+    my $dumper = Data::Dumper->new([$_[0]]);
+    $dumper->Indent(1)->Sortkeys(1)->Terse(1);
+    print $dumper->Dump;
+}
+
+
+1
+
+__END__
+
+=pod
+
+=head1 NAME
+
+ilo-sysinfo - fetch information about a system host through iLO
+
+=head1 SYNOPSIS
+
+    ilo-sysinfo [--username=user] [--password=pass] ilo-addr
+    ilo-sysinfo { --help | --man | --version }
+
+
+=head1 OPTIONS
+
+=head2 Program options
+
+=over
+
+=item B<-U>, B<--username> I<username>
+
+Specify the username. Defaults to C<Administrator>.
+
+=item B<-P>, B<--password> I<password>
+
+Specify the password.
+
+=item B<-F>, B<--format> I<json|yaml|perl>
+
+Specify the format to dump the information into: C<json>,
+C<perl> (Data::Dumper), C<yaml>. Default is C<yaml>.
+
+=back
+
+=head2 Help options
+
+=over
+
+=item B<-h>, B<--help>
+
+Print a short usage description, then exit.
+
+=item B<--man>
+
+Print the manual page of the program, then exit.
+
+=item B<-V>, B<--version>
+
+Print the program name and version, then exit.
+
+=back
+
+
+=head1 DESCRIPTION
+
+This small program requests information from the host of the target
+iLO subsystem and prints them on screen under the requested format.
+
+
+=head1 AUTHOR
+
+Sebastien Aperghis-Tramoni (sebastien@aperghis.net)
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright 2012 Sebastien Aperghis-Tramoni
+
+This program is free software; you can redistribute it and/or modify it
+under the MIT/X11 License.
+
+=cut
+
